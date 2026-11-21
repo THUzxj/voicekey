@@ -1,8 +1,9 @@
 //! 多渠道语音识别自动 LLM 融合定稿模块（OpenAI 兼容 `/v1/chat/completions`）。
 //!
 //! - 支持任意 OpenAI 兼容端点（OpenAI / DeepSeek / 通义 / Ollama / vLLM 等），支持非流式与 SSE 流式输出
-//! - 内置本地「高相似度自动跳过」机制（归一化编辑距离 + 最大一致团 + 防截断保护），零 Token 省费
-//! - 支持自定义 System Prompt 及实时 Prompt 预览
+//! - 内置本地「高相似度自动跳过」机制（归一化编辑距离 + 最大一致团 + 防截断保护 + 口语卡顿词检查），零 Token 省费
+//! - 支持自定义 System Prompt、`{{fillers}}` 占位符及实时 Prompt 预览
+use crate::fillers;
 use crate::util::strip_punctuation;
 use anyhow::{anyhow, bail, Result};
 use futures_util::StreamExt;
@@ -18,14 +19,25 @@ pub const MIN_SIMILARITY_THRESHOLD: f64 = 0.80;
 pub const MAX_SIMILARITY_THRESHOLD: f64 = 1.00;
 pub const DEFAULT_MIN_AGREE: usize = 2;
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = "\
+pub const DEFAULT_SYSTEM_PROMPT_CLEAN: &str = "\
 你是一个语音识别（ASR）多路结果融合专家。下面是一段同一份口语录音经多个语音识别引擎并行转写的结果。
 请综合对比所有渠道的识别结果，还原出最准确、完整、自然、标点合理的最终文本。
 
 融合原则：
 1. 完整性优先：若某渠道因中途停顿触发 VAD 提前截断而漏掉后半句，以识别完整的渠道为准。
 2. 多路交叉纠错：字词有分歧时，结合语音同音/近音规律与上下文语义选择最合理的词（含专有名词与中英文大小写）。
-3. 忠于原意：整理标点与排版，不得擅自增删或改写说话人的核心意思。
+3. 口语流畅度：去除无意义的口语卡顿与重复犹豫词（参考常见口语词：{{fillers}}），结合上下文判断，不得删掉有实际语义的词，也不得擅自改写说话人原意。
+4. 标点与排版：补全合理的标点与中英文排版。
+5. 输出要求：仅输出最终定稿文本，不要输出解释、分析、前缀或外层引号。";
+
+pub const DEFAULT_SYSTEM_PROMPT_KEEP: &str = "\
+你是一个语音识别（ASR）多路结果融合专家。下面是一段同一份口语录音经多个语音识别引擎并行转写的结果。
+请综合对比所有渠道的识别结果，还原出最准确、完整、标点合理的最终文本。
+
+融合原则：
+1. 完整性优先：若某渠道因中途停顿触发 VAD 提前截断而漏掉后半句，以识别完整的渠道为准。
+2. 多路交叉纠错：字词有分歧时，结合语音同音/近音规律与上下文语义选择最合理的词（含专有名词与中英文大小写）。
+3. 保留口语原貌：保留说话人原本的口语表达与语气词，只纠正识别错误和补充合理标点，不得擅自改写原意。
 4. 输出要求：仅输出最终定稿文本，不要输出解释、分析、前缀或外层引号。";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -48,6 +60,12 @@ pub struct Config {
     pub similarity_threshold: f64,
     /// 触发跳过的最少一致渠道数（2..=6）
     pub min_agree_channels: usize,
+    /// 是否自动去除口语卡顿词
+    pub remove_fillers: bool,
+    /// 用户自定义口语卡顿词
+    pub custom_fillers: Vec<String>,
+    /// 是否从历史识别差异中自动发现口语卡顿词
+    pub learn_fillers_from_history: bool,
 }
 
 impl Default for Config {
@@ -64,6 +82,9 @@ impl Default for Config {
             skip_similar: true,
             similarity_threshold: DEFAULT_SIMILARITY_THRESHOLD,
             min_agree_channels: DEFAULT_MIN_AGREE,
+            remove_fillers: true,
+            custom_fillers: Vec::new(),
+            learn_fillers_from_history: true,
         }
     }
 }
@@ -79,6 +100,13 @@ impl Config {
         }
         self.similarity_threshold = self.similarity_threshold.clamp(MIN_SIMILARITY_THRESHOLD, MAX_SIMILARITY_THRESHOLD);
         self.min_agree_channels = self.min_agree_channels.clamp(2, 6);
+        let mut seen = std::collections::HashSet::new();
+        self.custom_fillers = self
+            .custom_fillers
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && seen.insert(s.to_lowercase()))
+            .collect();
     }
 
     /// 配置是否可用（启用且已填 base_url 与 model；api_key 允许留空以兼容本地 Ollama/vLLM）
@@ -159,6 +187,7 @@ pub struct PromptPreview {
     pub system: String,
     pub user: String,
     pub default_system: String,
+    pub effective_fillers: Vec<String>,
     pub estimated_tokens: usize,
     pub source: String,
 }
@@ -173,12 +202,38 @@ pub struct SkipDecision {
     pub matrix: Vec<Vec<f64>>,
 }
 
-/// 组装实际发给 LLM 的 `(system_prompt, user_prompt)`
-pub fn build_prompt(cfg: &Config, candidates: &[CandidateInput]) -> (String, String) {
-    let system = if cfg.system_prompt.trim().is_empty() {
-        DEFAULT_SYSTEM_PROMPT.to_string()
+pub fn default_system_prompt(remove_fillers: bool) -> &'static str {
+    if remove_fillers {
+        DEFAULT_SYSTEM_PROMPT_CLEAN
+    } else {
+        DEFAULT_SYSTEM_PROMPT_KEEP
+    }
+}
+
+/// 组装实际发给 LLM 的 `(system_prompt, user_prompt, effective_fillers)`
+pub fn build_prompt(cfg: &Config, candidates: &[CandidateInput]) -> (String, String, Vec<String>) {
+    let eff = if cfg.remove_fillers {
+        fillers::effective_fillers(&cfg.custom_fillers, cfg.learn_fillers_from_history)
+    } else {
+        Vec::new()
+    };
+    let fillers_str = if eff.is_empty() {
+        "（无）".to_string()
+    } else {
+        eff.iter().map(|w| format!("「{w}」")).collect::<Vec<_>>().join("、")
+    };
+
+    let base = if cfg.system_prompt.trim().is_empty() {
+        default_system_prompt(cfg.remove_fillers).to_string()
     } else {
         cfg.system_prompt.trim().to_string()
+    };
+    let system = if base.contains("{{fillers}}") {
+        base.replace("{{fillers}}", &fillers_str)
+    } else if cfg.remove_fillers && !eff.is_empty() {
+        format!("{base}\n\n说话人常见口语卡顿词参考（请结合上下文判断，勿误删有实义的词）：{fillers_str}")
+    } else {
+        base
     };
 
     let mut user = String::from("以下是各语音识别渠道的定稿结果：\n");
@@ -193,18 +248,19 @@ pub fn build_prompt(cfg: &Config, candidates: &[CandidateInput]) -> (String, Str
         }
         user.push('\n');
     }
-    (system, user)
+    (system, user, eff)
 }
 
 /// 设置页预览用：生成完整 `PromptPreview`
 pub fn preview_prompt(cfg: &Config, candidates: &[CandidateInput], source: &str) -> PromptPreview {
-    let (system, user) = build_prompt(cfg, candidates);
+    let (system, user, eff) = build_prompt(cfg, candidates);
     // 粗略估算 Token：中文约 1 字 ~ 1.5 token，ASCII 约 4 字符 ~ 1 token
     let est = estimate_tokens(&system) + estimate_tokens(&user);
     PromptPreview {
         system,
         user,
-        default_system: DEFAULT_SYSTEM_PROMPT.to_string(),
+        default_system: default_system_prompt(cfg.remove_fillers).to_string(),
+        effective_fillers: eff,
         estimated_tokens: est,
         source: source.to_string(),
     }
@@ -339,7 +395,20 @@ pub fn try_skip_similar(cfg: &Config, candidates: &[CandidateInput], preferred_o
         return None;
     }
 
-    // 在一致团内择优：1) 有句末标点优先 2) 标点数量更合理 3) 用户偏好顺序
+    // 若开启了去除口语卡顿词，检查一致团中是否至少有一条干净文本；若全部残留卡顿词，则交给 LLM 顺滑
+    let eff_fillers = if cfg.remove_fillers {
+        fillers::effective_fillers(&cfg.custom_fillers, cfg.learn_fillers_from_history)
+    } else {
+        Vec::new()
+    };
+    if cfg.remove_fillers
+        && !eff_fillers.is_empty()
+        && best_cluster.iter().all(|&idx| fillers::contains_filler(&candidates[idx].text, &eff_fillers))
+    {
+        return None;
+    }
+
+    // 在一致团内择优：1) 无卡顿词优先 2) 有句末标点优先 3) 标点数量更合理 4) 用户偏好顺序
     let pref_rank = |idx: usize| -> usize {
         preferred_order.iter().position(|&p| p == idx).unwrap_or(usize::MAX)
     };
@@ -347,9 +416,11 @@ pub fn try_skip_similar(cfg: &Config, candidates: &[CandidateInput], preferred_o
         .iter()
         .min_by_key(|&&idx| {
             let t = candidates[idx].text.trim();
+            let has_filler = cfg.remove_fillers && fillers::contains_filler(t, &eff_fillers);
             let has_end_punct = t.chars().last().is_some_and(|c| matches!(c, '。' | '！' | '？' | '.' | '!' | '?'));
             let punct_count = t.chars().filter(|c| matches!(c, '，' | '。' | '！' | '？' | '、' | '；' | ',' | '.' | '!' | '?')).count();
             (
+                usize::from(has_filler),
                 usize::from(!has_end_punct),
                 std::cmp::Reverse(punct_count),
                 pref_rank(idx),
@@ -402,7 +473,7 @@ pub async fn fuse(
     if model.is_empty() {
         bail!("请先填写 LLM 模型名称");
     }
-    let (system_prompt, user_prompt) = build_prompt(cfg, candidates);
+    let (system_prompt, user_prompt, _) = build_prompt(cfg, candidates);
     let use_stream = cfg.stream && on_delta.is_some();
     let timeout = Duration::from_millis(cfg.timeout_ms.clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS));
 
@@ -582,10 +653,25 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_uses_default_or_custom_system_prompt() {
-        let cfg = Config::default();
-        let (sys, user) = build_prompt(&cfg, &sample_candidates());
-        assert_eq!(sys, DEFAULT_SYSTEM_PROMPT);
+    fn skip_similar_hands_off_to_llm_when_all_agreed_channels_have_fillers() {
+        let mut cfg = Config::default();
+        cfg.remove_fillers = true;
+        let cands = vec![
+            CandidateInput { channel: "wetype".into(), text: "明天上午呃那个我们再确认一下方案。".into(), elapsed_ms: None, hints: vec![] },
+            CandidateInput { channel: "qwen".into(), text: "明天上午呃那个我们再确认一下方案".into(), elapsed_ms: None, hints: vec![] },
+        ];
+        assert!(try_skip_similar(&cfg, &cands, &[0, 1]).is_none());
+    }
+
+    #[test]
+    fn build_prompt_replaces_fillers_placeholder() {
+        let mut cfg = Config::default();
+        cfg.remove_fillers = true;
+        cfg.custom_fillers = vec!["然后呢".into()];
+        let (sys, user, eff) = build_prompt(&cfg, &sample_candidates());
+        assert!(eff.iter().any(|w| w == "然后呢"));
+        assert!(sys.contains("「然后呢」"));
+        assert!(!sys.contains("{{fillers}}"));
         assert!(user.contains("[doubao]"));
     }
 }

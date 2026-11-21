@@ -22,13 +22,16 @@ export interface LlmConfig {
   enabled: boolean; baseUrl: string; apiKey: string; model: string;
   autoInsert: boolean; stream: boolean; timeoutMs: number; systemPrompt: string;
   skipSimilar: boolean; similarityThreshold: number; minAgreeChannels: number;
+  removeFillers: boolean; customFillers: string[]; learnFillersFromHistory: boolean;
 }
 export interface LlmUsage { promptTokens: number; completionTokens: number; totalTokens: number }
 export interface LlmTested { text: string; ms: number; model: string; usage?: LlmUsage | null }
 export interface PromptPreview {
-  system: string; user: string; defaultSystem: string;
+  system: string; user: string; defaultSystem: string; effectiveFillers: string[];
   estimatedTokens: number; source: string;
 }
+export type FillerStatus = "suggested" | "accepted" | "ignored";
+export interface LearnedFiller { word: string; count: number; lastSeenMs: number; status: FillerStatus }
 export type LlmState = "idle" | "busy" | "ready" | "skipped" | "failed";
 export interface FinalizedRow {
   state: LlmState; text: string; ms: number | null; note?: string | null; sourceChannel?: Channel | null;

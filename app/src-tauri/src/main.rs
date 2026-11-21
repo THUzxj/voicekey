@@ -315,6 +315,22 @@ fn llm_preview_prompt(config: voicekey_core::llm::Config) -> voicekey_core::llm:
     voicekey_core::llm::preview_prompt(&config, &cands, "内置示例")
 }
 
+#[tauri::command]
+fn fillers_list() -> Vec<voicekey_core::fillers::LearnedFiller> {
+    voicekey_core::fillers::list_learned()
+}
+
+#[tauri::command]
+fn fillers_decide(word: String, status: voicekey_core::fillers::FillerStatus) -> Vec<voicekey_core::fillers::LearnedFiller> {
+    voicekey_core::fillers::set_status(&word, status)
+}
+
+#[tauri::command]
+fn fillers_clear() -> Vec<voicekey_core::fillers::LearnedFiller> {
+    voicekey_core::fillers::clear_learned();
+    Vec::new()
+}
+
 fn main() {
     if let Some(code) = offline::worker_main() {
         std::process::exit(code);
@@ -328,7 +344,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_state, set_settings, perm_status, perm_action, microphones, record_shortcut,
             pick_choose, pick_choose_final, pick_key, pick_resize, compare_toggle, meter, open_url, model_download,
-            update_check, update_install, jev_test, llm_test, llm_preview_prompt,
+            update_check, update_install, jev_test, llm_test, llm_preview_prompt, fillers_list, fillers_decide, fillers_clear,
             preview_sound, list_sounds,
             account_save, account_login, account_logout, get_recognition_history, clear_recognition_history
         ])

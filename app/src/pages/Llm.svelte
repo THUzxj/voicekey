@@ -1,10 +1,20 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { app, save } from "../lib/store.svelte";
-  import { call, type LlmConfig, type LlmTested, type PromptPreview } from "../lib/api";
+  import {
+    call,
+    type FillerStatus,
+    type LearnedFiller,
+    type LlmConfig,
+    type LlmTested,
+    type PromptPreview,
+  } from "../lib/api";
 
-  let d = $state<LlmConfig>({ ...app.s!.llm });
+  let d = $state<LlmConfig>({ ...app.s!.llm, customFillers: [...app.s!.llm.customFillers] });
   let busy = $state(false);
   let testResult = $state<{ ok: boolean; text: string } | null>(null);
+  let newFiller = $state("");
+  let learned = $state<LearnedFiller[]>([]);
   let showPreview = $state(false);
   let preview = $state<PromptPreview | null>(null);
   let timeoutSec = $state<number>(Math.round(d.timeoutMs / 1000));
@@ -16,7 +26,7 @@
     d.timeoutMs = Math.max(2, Math.min(30, Number.isFinite(timeoutSec) ? timeoutSec : 8)) * 1000;
     timeoutSec = Math.round(d.timeoutMs / 1000);
     d.similarityThreshold = Math.max(80, Math.min(100, simPercent)) / 100;
-    const patch: Record<string, unknown> = { llm: { ...d } };
+    const patch: Record<string, unknown> = { llm: { ...d, customFillers: [...d.customFillers] } };
     // 启用 LLM 融合定稿时自动关闭 Jev，避免双重接管
     if (d.enabled && app.s!.jev.mode !== "off") {
       patch.jev = { ...app.s!.jev, mode: "off" };
@@ -33,7 +43,9 @@
 
   async function refreshPreview() {
     try {
-      preview = await call<PromptPreview>("llm_preview_prompt", { config: { ...d } });
+      preview = await call<PromptPreview>("llm_preview_prompt", {
+        config: { ...d, customFillers: [...d.customFillers] },
+      });
     } catch {
       preview = null;
     }
@@ -63,11 +75,53 @@
     }
   }
 
+  function addFiller() {
+    const parts = newFiller
+      .split(/[,，、\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!parts.length) return;
+    const seen = new Set(d.customFillers.map((w) => w.toLowerCase()));
+    for (const p of parts) {
+      if (!seen.has(p.toLowerCase())) {
+        d.customFillers = [...d.customFillers, p];
+        seen.add(p.toLowerCase());
+      }
+    }
+    newFiller = "";
+    commit();
+  }
+
+  function removeFiller(word: string) {
+    d.customFillers = d.customFillers.filter((w) => w !== word);
+    commit();
+  }
+
+  async function refreshLearned() {
+    try {
+      learned = await call<LearnedFiller[]>("fillers_list");
+    } catch {
+      learned = [];
+    }
+  }
+
+  async function decideLearned(word: string, status: FillerStatus) {
+    learned = await call<LearnedFiller[]>("fillers_decide", { word, status });
+    if (showPreview) refreshPreview();
+  }
+
+  async function clearLearned() {
+    learned = await call<LearnedFiller[]>("fillers_clear");
+    if (showPreview) refreshPreview();
+  }
+
   async function testConn() {
     busy = true;
     testResult = null;
     try {
-      const t = await call<LlmTested>("llm_test", { config: { ...d } });
+      const t = await call<LlmTested>("llm_test", {
+        config: { ...d, customFillers: [...d.customFillers] },
+      });
       const tok = t.usage ? ` · ${t.usage.totalTokens} tokens` : "";
       testResult = { ok: true, text: `定稿：${t.text}（${t.ms}ms · ${t.model}${tok}）` };
     } catch (e) {
@@ -76,6 +130,10 @@
       busy = false;
     }
   }
+
+  onMount(() => {
+    refreshLearned();
+  });
 </script>
 
 <h3>LLM 融合定稿（OpenAI 兼容）</h3>
@@ -218,12 +276,104 @@
       </div>
     {/if}
 
+    <!-- 口语卡顿词处理 -->
+    <div class="row">
+      <div class="lbl">
+        自动去除口语卡顿词
+        <small>开启后结合上下文清理无意义语气/犹豫词；关闭则保留原话语气，仅纠错与补标点</small>
+      </div>
+      <button
+        class="sw"
+        class:on={d.removeFillers}
+        onclick={() => {
+          d.removeFillers = !d.removeFillers;
+          commit();
+        }}
+        aria-label="自动去除口语卡顿词"
+      ></button>
+    </div>
+    {#if d.removeFillers}
+      <div class="row col">
+        <div class="lbl">
+          自定义口语卡顿词
+          <small>输入你常说的口语词（逗号或空格分隔），会动态注入 Prompt 供模型结合上下文参考</small>
+        </div>
+        <div class="adder">
+          <input
+            class="in"
+            type="text"
+            placeholder="例如：呃哪、然后呢、就是说"
+            bind:value={newFiller}
+            onkeydown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                addFiller();
+              }
+            }}
+          />
+          <button class="btn" onclick={addFiller}>添加</button>
+        </div>
+        {#if d.customFillers.length}
+          <div class="chips">
+            {#each d.customFillers as w}
+              <span class="chip">{w}<button class="x" onclick={() => removeFiller(w)} aria-label="删除">×</button></span>
+            {/each}
+          </div>
+        {/if}
+      </div>
+      <div class="row">
+        <div class="lbl">
+          从历史识别自动发现口语卡顿词
+          <small>本地统计多渠道对比与 LLM 定稿中被反复删掉的 1–3 字短词（出现 ≥3 次后推荐）</small>
+        </div>
+        <button
+          class="sw"
+          class:on={d.learnFillersFromHistory}
+          onclick={() => {
+            d.learnFillersFromHistory = !d.learnFillersFromHistory;
+            commit();
+          }}
+          aria-label="从历史自动发现口语卡顿词"
+        ></button>
+      </div>
+      {#if d.learnFillersFromHistory}
+        <div class="row col">
+          <div class="bar-hd">
+            <span class="mini">历史发现的口语词（{learned.length}）</span>
+            <div class="acts">
+              <button class="linkbtn" onclick={refreshLearned}>刷新</button>
+              {#if learned.length}<button class="linkbtn" onclick={clearLearned}>清空</button>{/if}
+            </div>
+          </div>
+          {#if learned.length}
+            <div class="chips">
+              {#each learned as item}
+                <span class="chip" class:acc={item.status === "accepted"} class:ign={item.status === "ignored"}>
+                  {item.word}<em>×{item.count}</em>
+                  {#if item.status !== "accepted"}
+                    <button class="okbtn" title="采纳到卡顿词表" onclick={() => decideLearned(item.word, "accepted")}>✓</button>
+                  {/if}
+                  {#if item.status !== "ignored"}
+                    <button class="x" title="忽略" onclick={() => decideLearned(item.word, "ignored")}>×</button>
+                  {:else}
+                    <button class="okbtn" title="恢复" onclick={() => decideLearned(item.word, "suggested")}>↺</button>
+                  {/if}
+                </span>
+              {/each}
+            </div>
+          {:else}
+            <div class="hint">暂无达到推荐频次（≥3 次）的历史发现词，多说几次后会自动汇总到这里。</div>
+          {/if}
+        </div>
+      {/if}
+    {/if}
+
     <!-- 自定义 Prompt 与实时预览 -->
     <div class="row col">
       <div class="bar-hd">
         <div class="lbl">
           自定义 System Prompt
-          <small>留空使用内置默认提示词</small>
+          <small>留空使用内置默认提示词；支持 <code>{"{{fillers}}"}</code> 占位符插入当前生效卡顿词表</small>
         </div>
         <div class="acts">
           {#if !d.systemPrompt.trim()}
@@ -290,9 +440,23 @@
   .unit { font-size: 12px; color: var(--fg2); }
   .rng { width: 140px; accent-color: var(--accent); }
   .row.col { flex-direction: column; align-items: stretch; gap: 8px; }
+  .adder { display: flex; gap: 8px; }
+  .adder .in { flex: 1; width: auto; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--bg); font-size: 12px; color: var(--fg);
+  }
+  .chip.acc { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); background: color-mix(in srgb, var(--accent) 10%, var(--bg)); }
+  .chip.ign { opacity: 0.5; text-decoration: line-through; }
+  .chip em { font-style: normal; font-size: 11px; color: var(--fg3); }
+  .chip .x, .chip .okbtn { border: 0; background: transparent; cursor: pointer; padding: 0 2px; font-size: 12px; color: var(--fg3); line-height: 1; }
+  .chip .x:hover { color: var(--err); }
+  .chip .okbtn:hover { color: var(--accent); }
   .bar-hd { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
   .acts { display: flex; align-items: center; gap: 10px; flex: none; }
   .mini { font-size: 11.5px; color: var(--fg2); font-weight: 500; }
+  .hint { font-size: 11.5px; color: var(--fg3); }
   .linkbtn { border: 0; background: transparent; color: var(--accent); cursor: pointer; font: inherit; font-size: 12px; padding: 0; }
   .linkbtn:hover { text-decoration: underline; }
   .smbtn { padding: 4px 10px; font-size: 12px; }
@@ -308,6 +472,7 @@
     font-size: 11.5px; line-height: 1.5; color: var(--fg2); max-height: 180px; overflow-y: auto;
     padding: 6px 8px; border-radius: 6px; background: var(--card); border: 1px solid var(--line);
   }
+  code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; padding: 1px 4px; border-radius: 4px; background: var(--bg); border: 1px solid var(--line); }
   .ok { color: var(--ok, #2ea043); }
   .err { color: var(--err); }
 </style>

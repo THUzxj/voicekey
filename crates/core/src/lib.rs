@@ -4,6 +4,7 @@ pub mod bageshuo;
 pub mod baidu;
 pub mod chatterfly;
 pub mod doubao;
+pub mod fillers;
 pub mod jev;
 pub mod llm;
 mod platform_roots;

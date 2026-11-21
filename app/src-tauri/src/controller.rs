@@ -1505,6 +1505,10 @@ impl Ctl {
         if let Some(skip) = voicekey_core::llm::try_skip_similar(&cfg, &candidates, &pref) {
             let (_, ch, text, _) = &finals[skip.picked_index];
             self.timeout_token += 1;
+            if cfg.learn_fillers_from_history {
+                let raws: Vec<String> = finals.iter().map(|(_, _, t, _)| t.clone()).collect();
+                voicekey_core::fillers::learn_from_session(&raws, text);
+            }
             self.finalized = Some(FinalizedRow {
                 state: LlmState::Skipped,
                 text: text.clone(),
@@ -1570,6 +1574,15 @@ impl Ctl {
         let cfg = self.settings().llm;
         match res {
             Ok(out) => {
+                if cfg.learn_fillers_from_history {
+                    let raws: Vec<String> = self
+                        .rows
+                        .iter()
+                        .filter(|r| r.state == RowState::Final && !r.text.is_empty())
+                        .map(|r| r.text.clone())
+                        .collect();
+                    voicekey_core::fillers::learn_from_session(&raws, &out.text);
+                }
                 let note = match &out.usage {
                     Some(u) => format!("{} · {} tok", out.model, u.total_tokens),
                     None => out.model.clone(),
